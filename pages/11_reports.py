@@ -123,7 +123,7 @@ with tab_pl:
             return "color: green; font-weight:bold" if val >= 0 else "color: red; font-weight:bold"
         return ""
 
-    styled = grp.style.map(colour_profit, subset=["Profit"]).format({c: "£{:,.2f}" for c in currency_cols})
+    styled = grp.style.applymap(colour_profit, subset=["Profit"]).format({c: "£{:,.2f}" for c in currency_cols})
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # Totals row
@@ -172,8 +172,7 @@ with tab_hotel:
         plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
         font_color="#1C2B3A", showlegend=False,
         xaxis_tickangle=-45
-    ).map(
-        lambda v: "color:green;font-weight:bold" if isinstance(v,(int,float)) and v>=0 else "color:red;font-weight:bold",
+    )
     fig_bar.update_traces(textposition="outside")
     st.plotly_chart(fig_bar, use_container_width=True)
 
