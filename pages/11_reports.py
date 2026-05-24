@@ -100,15 +100,7 @@ with tab_pl:
     elif report_type == "Yearly":
         grp = df_f.groupby(["year","client"]).agg(
             Income=("income_net","sum"), Payroll=("payroll_cost","sum"),
-            SelfEmp=("self_emp_cost","sum"), UTR=("utr_cost","sum"),
-            Other=("other_expenses","sum"), Profit=("gross_profit","sum")
-        ).reset_index()
-        grp.rename(columns={"year":"Year","client":"Hotel"}, inplace=True)
-
-    else:  # All Time
-        grp = df_f.groupby("client").agg(
-            Income=("income_net","sum"), Payroll=("payroll_cost","sum"),
-            SelfEmp=("self_emp_cost","sum"), UTR=("utr_cost","sum"),
+            st.dataframe(grp, use_container_width=True, hide_index=True)
             Other=("other_expenses","sum"), Profit=("gross_profit","sum")
         ).reset_index()
         grp.rename(columns={"client":"Hotel"}, inplace=True)
@@ -165,12 +157,7 @@ with tab_hotel:
         hotel_summary, x="Hotel", y="Profit",
         color="Profit", color_continuous_scale=["#e74c3c","#f39c12","#27ae60"],
         title="Gross Profit by Hotel",
-        labels={"Profit":"Gross Profit (£)"},
-        text=hotel_summary["Profit"].apply(lambda x: f"£{x:,.0f}")
-    )
-    fig_bar.update_layout(
-        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-        font_color="#1C2B3A", showlegend=False,
+        st.dataframe(hotel_summary, use_container_width=True, hide_index=True)
         xaxis_tickangle=-45
     ).map(
     fig_bar.update_traces(textposition="outside")
