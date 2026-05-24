@@ -1,14 +1,11 @@
 import streamlit as st
-from db import get_client
-from style import page_header
+from db import get_client, page_header
 
 st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
-
 page_header("📊 Portal Dashboard", "Live overview — ARVY Hospitality Solutions Ltd")
 
 db = get_client()
 
-# --- Metrics ---
 try:
     emp_count    = len(db.table("employees").select("id").eq("is_active", True).execute().data)
     client_count = len(db.table("clients").select("id").eq("is_active", True).execute().data)
@@ -24,8 +21,6 @@ col3.metric("📅 Weeks on Record",  week_count)
 col4.metric("📤 Total Uploads",    upload_count)
 
 st.markdown("---")
-
-# --- Quick status ---
 st.markdown("### 🚀 Getting Started")
 
 c1, c2 = st.columns(2)
