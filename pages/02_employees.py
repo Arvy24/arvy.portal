@@ -1,11 +1,10 @@
-# ── Employees page — bulk upload, add, remove ────────────────
 import streamlit as st
 import pandas as pd
 import io
-from db import get_client
+from db import get_client, page_header
 
-st.title("👥 Employee Management")
-st.markdown("---")
+st.set_page_config(page_title="Employees", page_icon="👥", layout="wide")
+page_header("👥 Employee Management", "Add, search, upload and manage staff records")
 
 db = get_client()
 
