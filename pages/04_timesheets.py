@@ -8,17 +8,17 @@ st.title("📋 Timesheet Upload")
 supabase = get_client()
 
 # --- Load reference data ---
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_clients():
     res = supabase.table("clients").select("id,name,short_name,dept_number").eq("is_active", True).order("name").execute()
     return res.data
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_weeks():
     res = supabase.table("weeks").select("*").order("week_ending", desc=True).execute()
     return res.data
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_employees():
     res = supabase.table("employees").select("id,full_name,preferred_name,employee_ref,employment_type").eq("is_active", True).execute()
     return res.data
@@ -70,7 +70,10 @@ with st.sidebar.expander("➕ Add New Week"):
 
 client_names    = [c["name"] for c in clients]
 selected_client = st.sidebar.selectbox("🏨 Hotel / Client", client_names)
-client_id       = client_map[selected_client]
+client_id = client_map.get(selected_client)
+if not client_id:
+    st.error("⚠️ No hotels loaded. Click 🔄 Refresh Data in the sidebar.")
+    st.stop()
 
 st.sidebar.markdown("---")
 st.sidebar.info(f"📅 Week: **{selected_week}**\n\n🏨 Hotel: **{selected_client}**")
