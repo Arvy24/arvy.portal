@@ -13,7 +13,7 @@ supabase = get_client()
 CLIENT_ID     = "1000.GSW0VNVRO1JTNIWGLL9VMTUIK9FK1M"
 CLIENT_SECRET = "65462c0bc2c2504afd4626aeb2c6dfd66125870734"
 TOKEN_URL     = "https://accounts.zoho.eu/oauth/v2/token"
-API_BASE      = "https://books.zoho.eu/api/v3"
+API_BASE     = https://www.zohoapis.eu/books/v3
 
 try:
     REFRESH_TOKEN = st.secrets["ZOHO_REFRESH_TOKEN"]
