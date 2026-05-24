@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
-from db import get_client
-
+from db import get_client, page_header
 st.set_page_config(page_title="Timesheets", page_icon="📋", layout="wide")
-st.title("📋 Timesheet Upload")
+page_header("📋 Timesheet Upload", "Upload weekly Excel timesheets per hotel")
 
 supabase = get_client()
 
