@@ -1,145 +1,165 @@
 import streamlit as st
 import pandas as pd
+from datetime import date, timedelta
 from db import get_client, page_header
 
 st.set_page_config(page_title="Self-Emp Upload", page_icon="🧾", layout="wide")
-page_header("🧾 Self-Employed Payments", "Upload weekly self-employed payment records")
+page_header("🧾 Self-Employed Upload", "Upload self-employed payments — matched to timesheet employees by name")
 
 supabase = get_client()
 
 @st.cache_data(ttl=60)
 def load_clients():
-    return supabase.table("clients").select("id,name").eq("is_active",True).order("name").execute().data or []
-@st.cache_data(ttl=60)
-def load_weeks():
-    return supabase.table("weeks").select("*").order("week_ending",desc=True).execute().data or []
-@st.cache_data(ttl=60)
-def load_employees():
-    return supabase.table("employees").select("id,full_name,preferred_name,employee_ref").eq("is_active",True).execute().data or []
+    return supabase.table("clients").select("id,name").eq("is_active", True).order("name").execute().data or []
 
-if st.sidebar.button("🔄 Refresh Data"):
-    load_clients.clear(); load_weeks.clear(); load_employees.clear(); st.rerun()
+if st.sidebar.button("🔄 Refresh"):
+    load_clients.clear(); st.rerun()
 
-clients=load_clients(); weeks=load_weeks(); employees=load_employees()
-if not clients or not weeks:
-    st.error("⚠️ No hotels or weeks loaded."); st.stop()
+clients = load_clients()
+if not clients:
+    st.error("⚠️ No hotels found.")
+    st.stop()
 
-employee_map = {}
-for e in employees:
-    employee_map[e["full_name"].strip().lower()] = e
-    if e.get("preferred_name"): employee_map[e["preferred_name"].strip().lower()] = e
-    if e.get("employee_ref"):   employee_map[str(e["employee_ref"]).strip().lower()] = e
-
-st.sidebar.header("⚙️ Select Week & Hotel")
-week_options=[ w["week_ending"] for w in weeks]
-selected_week=st.sidebar.selectbox("Week Ending",week_options)
-week_id=next(w["id"] for w in weeks if w["week_ending"]==selected_week)
-client_names=[c["name"] for c in clients]
-selected_client=st.sidebar.selectbox("🏨 Hotel / Client",client_names)
-client_id=next(c["id"] for c in clients if c["name"]==selected_client)
+st.sidebar.header("⚙️ Select Week")
+week_date = st.sidebar.date_input(
+    "📅 Week Date",
+    value=date.today() - timedelta(days=date.today().weekday()),
+)
+client_names    = [c["name"] for c in clients]
+selected_client = st.sidebar.selectbox("🏨 Hotel (optional)", ["All Hotels"] + client_names)
 st.sidebar.markdown("---")
-st.sidebar.info(f"📅 Week: **{selected_week}**\n\n🏨 Hotel: **{selected_client}**")
+
+@st.cache_data(ttl=30)
+def load_week_records(wd):
+    return supabase.table("weekly_records").select("id,employee_name,client_name,hours_worked,self_emp_amount")\
+        .eq("week_date", str(wd)).execute().data or []
+
+week_recs   = load_week_records(week_date)
+name_lookup = {r["employee_name"].strip().lower(): r for r in week_recs}
+
+if week_recs:
+    st.info(f"📋 Found **{len(week_recs)}** timesheet records for week **{week_date}**")
+else:
+    st.warning(f"⚠️ No timesheet records for week **{week_date}**. Upload timesheets first.")
 
 st.markdown("---")
-st.subheader("📂 Upload Self-Employed Excel File")
-uploaded=st.file_uploader("Upload Excel file (.xlsx)",type=["xlsx","xls"])
+st.subheader("📂 Upload Self-Employed Excel")
+st.caption("Excel must have: **Employee Name** and **Amount** columns")
 
+uploaded = st.file_uploader("Upload Excel file", type=["xlsx", "xls", "csv"])
+
+df = None
 if uploaded:
-    xl=pd.ExcelFile(uploaded)
-    sheet=st.selectbox("Select Sheet",xl.sheet_names)
-    c1,c2=st.columns(2)
-    with c1: header_row=st.number_input("Header row (0=first)",0,20,0)
-    with c2: skip_last=st.number_input("Skip rows at bottom",0,10,1)
+    try:
+        if uploaded.name.endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            xl = pd.ExcelFile(uploaded)
+            sheet = st.selectbox("Select Sheet", xl.sheet_names) if len(xl.sheet_names) > 1 else xl.sheet_names[0]
+            header_row = st.number_input("Header row (0 = first row)", 0, 20, 0)
+            df = pd.read_excel(uploaded, sheet_name=sheet, header=int(header_row))
+        df = df.dropna(how="all").reset_index(drop=True)
+        st.success(f"✅ File loaded — {len(df)} rows")
+        st.dataframe(df.head(20), use_container_width=True)
+    except Exception as e:
+        st.error(f"File error: {e}")
 
-    df=pd.read_excel(uploaded,sheet_name=sheet,header=int(header_row))
-    df=df.dropna(how="all")
-    if skip_last>0: df=df.iloc[:-skip_last]
-    df=df.reset_index(drop=True)
-    st.dataframe(df.head(20),use_container_width=True)
-
+if df is not None:
     st.markdown("---")
     st.subheader("🗂️ Map Columns")
-    cols=["— not used —"]+list(df.columns.astype(str))
-
-    c1,c2,c3=st.columns(3)
+    cols = ["— not used —"] + list(df.columns.astype(str))
+    c1, c2 = st.columns(2)
     with c1:
-        name_col   = st.selectbox("👤 Employee Name / Ref",cols)
-        hours_col  = st.selectbox("⏱️ Hours Paid",cols)
+        name_col   = st.selectbox("👤 Employee Name column", cols)
     with c2:
-        rate_col   = st.selectbox("💷 Pay Rate (£/hr)",cols)
-        gross_col  = st.selectbox("💰 Gross Amount",cols)
-    with c3:
-        net_col    = st.selectbox("🏦 Net Amount",cols)
-        status_col = st.selectbox("📋 Payment Status (optional)",cols)
+        amount_col = st.selectbox("💰 Amount column", cols)
 
-    if name_col!="— not used —":
+    if name_col != "— not used —" and amount_col != "— not used —":
+        st.markdown("---")
+        st.subheader("🔍 Preview & Match")
+
         def safe_float(v):
-            try: return float(str(v).replace("£","").replace(",","").strip())
-            except: return 0.0
+            try:
+                return float(str(v).replace("£","").replace(",","").strip())
+            except:
+                return 0.0
 
-        preview=[]
-        for _,row in df.iterrows():
-            name_val=str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
-            if not name_val or name_val.lower() in ["nan","","name","employee","total"]: continue
-            emp=employee_map.get(name_val.lower())
-            preview.append({
-                "Name":       name_val,
-                "Hours":      safe_float(row[hours_col]) if hours_col!="— not used —" else 0,
-                "Rate (£)":   safe_float(row[rate_col])  if rate_col !="— not used —" else 0,
-                "Gross (£)":  safe_float(row[gross_col]) if gross_col!="— not used —" else 0,
-                "Net (£)":    safe_float(row[net_col])   if net_col  !="— not used —" else 0,
-                "Status":     str(row[status_col]) if status_col!="— not used —" and pd.notna(row.get(status_col)) else "paid",
-                "Match":      "✅ Found" if emp else "❌ Not Found",
-                "_emp":       emp,
+        skip_words = {"nan","","name","employee","total","grand total","employee name"}
+        rows = []
+        for _, row in df.iterrows():
+            name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
+            if name.lower() in skip_words or not name:
+                continue
+            amount = safe_float(row.get(amount_col, 0))
+            if amount == 0:
+                continue
+            matched = name.strip().lower() in name_lookup
+            rows.append({
+                "Employee Name": name,
+                "Self-Emp Amount £": amount,
+                "Match": "✅ Matched" if matched else "🆕 New",
             })
 
-        if preview:
-            st.markdown("---")
-            st.subheader("🔍 Preview & Match")
-            disp=pd.DataFrame([{k:v for k,v in r.items() if k!="_emp"} for r in preview])
-            st.dataframe(disp,use_container_width=True)
+        if rows:
+            preview_df = pd.DataFrame(rows)
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-            matched=sum(1 for r in preview if "✅" in r["Match"])
-            unmatched=sum(1 for r in preview if "❌" in r["Match"])
-            c1,c2,c3=st.columns(3)
-            c1.metric("Total",len(preview)); c2.metric("✅ Matched",matched); c3.metric("❌ Not Found",unmatched)
-            if unmatched: st.warning(f"⚠️ {unmatched} not found — will be skipped.")
+            matched_n = sum(1 for r in rows if "✅" in r["Match"])
+            new_n     = sum(1 for r in rows if "🆕" in r["Match"])
+            c1,c2,c3  = st.columns(3)
+            c1.metric("✅ Matched", matched_n)
+            c2.metric("🆕 New", new_n)
+            c3.metric("Total Self-Emp", f"£{sum(r['Self-Emp Amount £'] for r in rows):,.2f}")
 
-            total_net=sum(r["Net (£)"] for r in preview)
-            st.info(f"📊 Total Net Payment: **£{total_net:,.2f}** | Matched: **{matched}** employees")
+            if new_n:
+                st.warning(f"⚠️ {new_n} employee(s) not in timesheets — saved with 0 hours.")
 
-            if matched>0:
-                if st.button("💾 Save Self-Emp Payments",type="primary"):
-                    saved=0; errors=[]
-                    for r in preview:
-                        if "❌" in r["Match"]: continue
-                        emp=r["_emp"]
-                        try:
-                            supabase.table("self_emp_payments").upsert({
-                                "employee_id":   emp["id"],
-                                "client_id":     client_id,
-                                "week_id":       week_id,
-                                "hours_paid":    r["Hours"],
-                                "pay_rate":      r["Rate (£)"],
-                                "gross_amount":  r["Gross (£)"],
-                                "net_amount":    r["Net (£)"],
-                                "payment_status":r["Status"],
-                                "source_file":   uploaded.name,
-                            },on_conflict="employee_id,client_id,week_id").execute()
-                            saved+=1
-                        except Exception as e:
-                            errors.append(f"{r['Name']}: {e}")
+            if st.button("💾 Save Self-Employed Payments", type="primary", use_container_width=True):
+                saved = 0; errors = []
+                for r in rows:
+                    name = r["Employee Name"]
+                    try:
+                        rec = name_lookup.get(name.strip().lower())
+                        if rec:
+                            supabase.table("weekly_records").update({
+                                "self_emp_amount": r["Self-Emp Amount £"]
+                            }).eq("id", rec["id"]).execute()
+                        else:
+                            client = selected_client if selected_client != "All Hotels" else "Unknown"
+                            supabase.table("weekly_records").upsert({
+                                "week_date":       str(week_date),
+                                "employee_name":   name,
+                                "client_name":     client,
+                                "hours_worked":    0,
+                                "self_emp_amount": r["Self-Emp Amount £"],
+                            }, on_conflict="week_date,employee_name,client_name").execute()
+                        saved += 1
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
 
-                    supabase.table("upload_log").insert({
-                        "upload_type":"self_emp","filename":uploaded.name,
-                        "week_id":week_id,"records_processed":saved,
-                        "records_failed":len(errors),
-                        "status":"success" if not errors else "partial",
-                        "error_log":{"errors":errors} if errors else None
-                    }).execute()
-
-                    if errors:
-                        st.error(f"⚠️ Saved {saved} with {len(errors)} error(s):\n"+"\n".join(errors))
-                    else:
-                        st.success(f"✅ Saved {saved} self-emp payments — {selected_client} | Week {selected_week}!")
+                load_week_records.clear()
+                if errors:
+                    st.error(f"⚠️ Saved {saved}, errors:\n" + "\n".join(errors))
+                else:
+                    st.success(f"✅ Self-employed payments saved for {saved} employees — Week **{week_date}**")
                     st.balloons()
+        else:
+            st.warning("No valid rows found. Check column mapping.")
+
+st.markdown("---")
+st.subheader(f"📋 Self-Employed Records — Week {week_date}")
+try:
+    q = supabase.table("weekly_records").select("employee_name,client_name,hours_worked,self_emp_amount")\
+        .eq("week_date", str(week_date)).gt("self_emp_amount", 0).order("employee_name").execute().data or []
+    if q:
+        df_q = pd.DataFrame(q)
+        df_q.columns = ["Employee","Hotel","Hours","Self-Emp £"]
+        st.dataframe(df_q, use_container_width=True, hide_index=True)
+        st.metric("Total Self-Emp", f"£{df_q['Self-Emp £'].sum():,.2f}")
+    else:
+        st.info("No self-employed records yet for this week.")
+except Exception as e:
+    st.warning(f"Could not load: {e}")
+
+st.markdown("---")
+st.caption("🧾 Self-Employed Upload  •  ARVY Portal v1.0")
