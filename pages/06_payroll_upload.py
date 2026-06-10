@@ -1,10 +1,13 @@
 import streamlit as st
 import pandas as pd
+import pdfplumber
+import io
+import re
 from datetime import date, timedelta
 from db import get_client, page_header
 
 st.set_page_config(page_title="Payroll Upload", page_icon="💷", layout="wide")
-page_header("💷 Payroll Upload", "Upload payroll payments — matched to timesheet employees by name")
+page_header("💷 Payroll Upload", "Upload payroll PDF or Excel — matched to timesheet employees by name")
 
 supabase = get_client()
 
@@ -16,148 +19,267 @@ if st.sidebar.button("🔄 Refresh"):
     load_clients.clear(); st.rerun()
 
 clients = load_clients()
-if not clients:
-    st.error("⚠️ No hotels found.")
-    st.stop()
 
+# ── Sidebar ───────────────────────────────────────────────────
 st.sidebar.header("⚙️ Select Week")
 week_date = st.sidebar.date_input(
-    "📅 Week Date",
+    "📅 Week Date (start of week)",
     value=date.today() - timedelta(days=date.today().weekday()),
 )
-client_names    = [c["name"] for c in clients]
+client_names    = [c["name"] for c in clients] if clients else []
 selected_client = st.sidebar.selectbox("🏨 Hotel (optional)", ["All Hotels"] + client_names)
 st.sidebar.markdown("---")
 
+# ── Load timesheet employees for this week ────────────────────
 @st.cache_data(ttl=30)
 def load_week_records(wd):
-    return supabase.table("weekly_records").select("id,employee_name,client_name,hours_worked,payroll_amount")\
-        .eq("week_date", str(wd)).execute().data or []
+    return supabase.table("weekly_records").select(
+        "id,employee_name,client_name,hours_worked,payroll_amount"
+    ).eq("week_date", str(wd)).execute().data or []
 
 week_recs = load_week_records(week_date)
-filtered_recs = [r for r in week_recs if selected_client == "All Hotels" or r["client_name"] == selected_client]
+if selected_client != "All Hotels":
+    week_recs = [r for r in week_recs if r["client_name"] == selected_client]
 
-if filtered_recs:
-    st.info(f"📋 Found **{len(filtered_recs)}** timesheet records for week **{week_date}**")
+timesheet_names = [r["employee_name"] for r in week_recs]
+
+if week_recs:
+    st.info(f"📋 **{len(week_recs)}** timesheet employees found for week **{week_date}**")
 else:
     st.warning(f"⚠️ No timesheet records for week **{week_date}**. Upload timesheets first.")
 
-st.markdown("---")
-st.subheader("📂 Upload Payroll Excel")
-st.caption("Excel must have: **Employee Name** and **Net Pay / Amount** columns")
-
-uploaded = st.file_uploader("Upload Excel file", type=["xlsx", "xls", "csv"])
-
-df = None
-if uploaded:
-    try:
-        if uploaded.name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            xl = pd.ExcelFile(uploaded)
-            sheet = st.selectbox("Select Sheet", xl.sheet_names) if len(xl.sheet_names) > 1 else xl.sheet_names[0]
-            header_row = st.number_input("Header row (0 = first row)", 0, 20, 0)
-            df = pd.read_excel(uploaded, sheet_name=sheet, header=int(header_row))
-        df = df.dropna(how="all").reset_index(drop=True)
-        st.success(f"✅ File loaded — {len(df)} rows")
-        st.dataframe(df.head(20), use_container_width=True)
-    except Exception as e:
-        st.error(f"File error: {e}")
-
-if df is not None:
-    st.markdown("---")
-    st.subheader("🗂️ Map Columns")
-    cols = ["— not used —"] + list(df.columns.astype(str))
-    c1, c2 = st.columns(2)
-    with c1:
-        name_col   = st.selectbox("👤 Employee Name column", cols)
-    with c2:
-        amount_col = st.selectbox("💷 Amount / Net Pay column", cols)
-
-    if name_col != "— not used —" and amount_col != "— not used —":
-        st.markdown("---")
-        st.subheader("🔍 Preview & Match")
-
-        def safe_float(v):
-            try:
-                return float(str(v).replace("£","").replace(",","").strip())
-            except:
-                return 0.0
-
-        skip_words = {"nan","","name","employee","total","grand total","employee name"}
-        name_lookup = {r["employee_name"].strip().lower(): r for r in week_recs}
-
-        rows = []
-        for _, row in df.iterrows():
-            name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
-            if name.lower() in skip_words or not name:
-                continue
-            amount = safe_float(row.get(amount_col, 0))
-            if amount == 0:
-                continue
-            matched = name.strip().lower() in name_lookup
-            rows.append({
-                "Employee Name": name,
-                "Payroll Amount £": amount,
-                "Match": "✅ Matched" if matched else "🆕 New",
-            })
-
-        if rows:
-            preview_df = pd.DataFrame(rows)
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
-
-            matched_n = sum(1 for r in rows if "✅" in r["Match"])
-            new_n     = sum(1 for r in rows if "🆕" in r["Match"])
-            c1,c2,c3  = st.columns(3)
-            c1.metric("✅ Matched", matched_n)
-            c2.metric("🆕 New", new_n)
-            c3.metric("Total Payroll", f"£{sum(r['Payroll Amount £'] for r in rows):,.2f}")
-
-            if new_n:
-                st.warning(f"⚠️ {new_n} employee(s) not in timesheets — saved with 0 hours.")
-
-            if st.button("💾 Save Payroll", type="primary", use_container_width=True):
-                saved = 0; errors = []
-                for r in rows:
-                    name = r["Employee Name"]
+# ── PDF parser ────────────────────────────────────────────────
+def parse_payroll_pdf(file_bytes):
+    """Extract employee ref, name, gross pay, net pay from ARVY payroll PDF."""
+    employees = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.split('\n'):
+                tokens = line.strip().split()
+                if not tokens or not tokens[0].isdigit():
+                    continue
+                # Skip total/summary lines
+                if any(kw in line.lower() for kw in ['total:', 'department:', 'process date total']):
+                    continue
+                emp_ref = tokens[0]
+                name_parts = []
+                num_start = 1
+                for i, t in enumerate(tokens[1:], 1):
                     try:
-                        rec = name_lookup.get(name.strip().lower())
-                        if rec:
-                            supabase.table("weekly_records").update({
-                                "payroll_amount": r["Payroll Amount £"]
-                            }).eq("id", rec["id"]).execute()
-                        else:
-                            client = selected_client if selected_client != "All Hotels" else "Unknown"
-                            supabase.table("weekly_records").upsert({
-                                "week_date":      str(week_date),
-                                "employee_name":  name,
-                                "client_name":    client,
-                                "hours_worked":   0,
-                                "payroll_amount": r["Payroll Amount £"],
-                            }, on_conflict="week_date,employee_name,client_name").execute()
-                        saved += 1
-                    except Exception as e:
-                        errors.append(f"{name}: {e}")
+                        float(t.replace(',', ''))
+                        num_start = i
+                        break
+                    except ValueError:
+                        name_parts.append(t)
+                if not name_parts:
+                    continue
+                numbers = []
+                for t in tokens[num_start:]:
+                    try:
+                        numbers.append(float(t.replace(',', '')))
+                    except ValueError:
+                        pass
+                if len(numbers) < 3:
+                    continue
+                employees.append({
+                    'emp_ref':   emp_ref,
+                    'pdf_name':  ' '.join(name_parts),
+                    'gross_pay': numbers[1],
+                    'net_pay':   numbers[-1],
+                })
+    return employees
 
-                load_week_records.clear()
-                if errors:
-                    st.error(f"⚠️ Saved {saved}, errors:\n" + "\n".join(errors))
+# ── Name matching helper ──────────────────────────────────────
+def best_match(pdf_name, timesheet_list):
+    """Try to find the best matching timesheet name for a PDF payroll name."""
+    if not timesheet_list:
+        return None
+    pdf_lower   = pdf_name.lower()
+    pdf_surname = pdf_lower.split()[-1] if pdf_lower.split() else ""
+
+    # 1. Exact match
+    for n in timesheet_list:
+        if n.lower() == pdf_lower:
+            return n
+
+    # 2. Surname match (last word)
+    surname_matches = [n for n in timesheet_list if pdf_surname and pdf_surname in n.lower()]
+    if len(surname_matches) == 1:
+        return surname_matches[0]
+
+    # 3. Any word overlap
+    pdf_words = set(pdf_lower.split())
+    for n in timesheet_list:
+        ts_words = set(n.lower().split())
+        if pdf_words & ts_words:
+            return n
+
+    return None
+
+# ── Upload ────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("📂 Upload Payroll File")
+
+file_type = st.radio("File format", ["PDF", "Excel (.xlsx / .csv)"], horizontal=True)
+
+uploaded = st.file_uploader(
+    "Upload payroll file",
+    type=["pdf"] if file_type == "PDF" else ["xlsx", "xls", "csv"]
+)
+
+parsed_rows = []   # list of dicts: pdf_name, matched_name, net_pay, gross_pay
+
+if uploaded:
+    # ── PDF ──────────────────────────────────────────────────
+    if file_type == "PDF":
+        try:
+            employees = parse_payroll_pdf(uploaded.read())
+            if not employees:
+                st.error("❌ No employee data found in this PDF. Check it's an ARVY payroll summary PDF.")
+            else:
+                st.success(f"✅ Found **{len(employees)}** employees in PDF")
+                for emp in employees:
+                    matched = best_match(emp['pdf_name'], timesheet_names)
+                    parsed_rows.append({
+                        'PDF Name':       emp['pdf_name'],
+                        'Emp Ref':        emp['emp_ref'],
+                        'Gross Pay £':    emp['gross_pay'],
+                        'Net Pay £':      emp['net_pay'],
+                        'Matched To':     matched or '— no match —',
+                    })
+        except Exception as e:
+            st.error(f"❌ PDF error: {e}")
+
+    # ── Excel ─────────────────────────────────────────────────
+    else:
+        try:
+            if uploaded.name.endswith('.csv'):
+                df = pd.read_csv(uploaded)
+            else:
+                xl = pd.ExcelFile(uploaded)
+                sheet = st.selectbox("Sheet", xl.sheet_names) if len(xl.sheet_names) > 1 else xl.sheet_names[0]
+                header_row = st.number_input("Header row (0 = first row)", 0, 20, 0)
+                df = pd.read_excel(uploaded, sheet_name=sheet, header=int(header_row))
+            df = df.dropna(how='all').reset_index(drop=True)
+            st.dataframe(df.head(20), use_container_width=True)
+
+            cols = ['— not used —'] + list(df.columns.astype(str))
+            c1, c2 = st.columns(2)
+            with c1:
+                name_col = st.selectbox("👤 Employee Name column", cols)
+            with c2:
+                amt_col  = st.selectbox("💷 Net Pay / Amount column", cols)
+
+            if name_col != '— not used —' and amt_col != '— not used —':
+                skip = {'nan','','name','employee','total','grand total','employee name'}
+                for _, row in df.iterrows():
+                    n = str(row[name_col]).strip() if pd.notna(row[name_col]) else ''
+                    if n.lower() in skip or not n:
+                        continue
+                    try:
+                        amt = float(str(row[amt_col]).replace('£','').replace(',','').strip())
+                    except:
+                        continue
+                    if amt == 0:
+                        continue
+                    matched = best_match(n, timesheet_names)
+                    parsed_rows.append({
+                        'PDF Name':    n,
+                        'Emp Ref':     '—',
+                        'Gross Pay £': amt,
+                        'Net Pay £':   amt,
+                        'Matched To':  matched or '— no match —',
+                    })
+        except Exception as e:
+            st.error(f"❌ Excel error: {e}")
+
+# ── Preview & manual matching ─────────────────────────────────
+if parsed_rows:
+    st.markdown("---")
+    st.subheader("🔍 Preview & Confirm Matching")
+    st.caption("The app tries to auto-match payroll names to your timesheet names. Correct any that say '— no match —' using the dropdown.")
+
+    match_options = ['— skip —'] + timesheet_names
+
+    confirmed = []
+    for i, row in enumerate(parsed_rows):
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        with c1:
+            st.markdown(f"**{row['PDF Name']}** (Ref: {row['Emp Ref']})")
+        with c2:
+            current_idx = 0
+            if row['Matched To'] in match_options:
+                current_idx = match_options.index(row['Matched To'])
+            sel = st.selectbox(
+                f"Match to timesheet employee",
+                match_options,
+                index=current_idx,
+                key=f"match_{i}",
+                label_visibility="collapsed"
+            )
+        with c3:
+            st.markdown(f"Gross: **£{row['Gross Pay £']:,.2f}**")
+        with c4:
+            st.markdown(f"Net: **£{row['Net Pay £']:,.2f}**")
+        confirmed.append({'timesheet_name': sel, 'net_pay': row['Net Pay £'], 'pdf_name': row['PDF Name']})
+
+    st.markdown("---")
+    valid     = [r for r in confirmed if r['timesheet_name'] != '— skip —']
+    skipped   = [r for r in confirmed if r['timesheet_name'] == '— skip —']
+    total_net = sum(r['net_pay'] for r in valid)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Employees to Save", len(valid))
+    c2.metric("Skipped", len(skipped))
+    c3.metric("Total Net Pay", f"£{total_net:,.2f}")
+
+    if valid and st.button("💾 Save Payroll Payments", type="primary", use_container_width=True):
+        saved = 0; errors = []
+
+        # Build lookup: timesheet_name → record id
+        rec_lookup = {r["employee_name"]: r for r in week_recs}
+
+        for r in valid:
+            ts_name = r['timesheet_name']
+            try:
+                rec = rec_lookup.get(ts_name)
+                if rec:
+                    supabase.table("weekly_records").update({
+                        "payroll_amount": r['net_pay']
+                    }).eq("id", rec["id"]).execute()
                 else:
-                    st.success(f"✅ Payroll saved for {saved} employees — Week **{week_date}**")
-                    st.balloons()
-        else:
-            st.warning("No valid rows found. Check column mapping.")
+                    client = selected_client if selected_client != "All Hotels" else "Unknown"
+                    supabase.table("weekly_records").upsert({
+                        "week_date":      str(week_date),
+                        "employee_name":  ts_name,
+                        "client_name":    client,
+                        "hours_worked":   0,
+                        "payroll_amount": r['net_pay'],
+                    }, on_conflict="week_date,employee_name,client_name").execute()
+                saved += 1
+            except Exception as e:
+                errors.append(f"{ts_name}: {e}")
 
+        load_week_records.clear()
+        if errors:
+            st.error(f"⚠️ Saved {saved}, errors:\n" + "\n".join(errors))
+        else:
+            st.success(f"✅ Payroll saved for {saved} employees — Week **{week_date}**")
+            st.balloons()
+
+# ── Current week summary ──────────────────────────────────────
 st.markdown("---")
 st.subheader(f"📋 Payroll Records — Week {week_date}")
 try:
-    q = supabase.table("weekly_records").select("employee_name,client_name,hours_worked,payroll_amount")\
-        .eq("week_date", str(week_date)).gt("payroll_amount", 0).order("employee_name").execute().data or []
+    q = supabase.table("weekly_records").select(
+        "employee_name,client_name,hours_worked,payroll_amount"
+    ).eq("week_date", str(week_date)).gt("payroll_amount", 0).order("employee_name").execute().data or []
     if q:
         df_q = pd.DataFrame(q)
         df_q.columns = ["Employee","Hotel","Hours","Payroll £"]
         st.dataframe(df_q, use_container_width=True, hide_index=True)
-        st.metric("Total Payroll", f"£{df_q['Payroll £'].sum():,.2f}")
+        st.metric("Total Net Pay", f"£{df_q['Payroll £'].sum():,.2f}")
     else:
         st.info("No payroll records yet for this week.")
 except Exception as e:
