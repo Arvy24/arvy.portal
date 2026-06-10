@@ -1,10 +1,12 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
+import openpyxl
+import re
+from datetime import datetime, date
 from db import get_client, page_header
 
 st.set_page_config(page_title="Timesheet Upload", page_icon="⏱️", layout="wide")
-page_header("⏱️ Timesheet Upload", "Upload weekly timesheets per hotel — employees created automatically")
+page_header("⏱️ Timesheet Upload", "Upload weekly rota — employees and hours extracted automatically")
 
 supabase = get_client()
 
@@ -16,107 +18,167 @@ if st.sidebar.button("🔄 Refresh"):
     load_clients.clear(); st.rerun()
 
 clients = load_clients()
-if not clients:
-    st.error("⚠️ No hotels found. Add hotels in the Clients page first.")
-    st.stop()
 
-# ── Sidebar ───────────────────────────────────────────────────
-st.sidebar.header("⚙️ Week & Hotel")
-week_date = st.sidebar.date_input(
-    "📅 Week Date (Monday)",
-    value=date.today() - timedelta(days=date.today().weekday()),
-)
-client_names    = [c["name"] for c in clients]
-selected_client = st.sidebar.selectbox("🏨 Hotel", client_names)
-st.sidebar.markdown("---")
-st.sidebar.info(f"📅 Week: **{week_date}**\n\n🏨 Hotel: **{selected_client}**")
+# ── Parse timesheet in ARVY rota format ──────────────────────
+def parse_arvy_timesheet(file_bytes):
+    """
+    Parses ARVY rota Excel format:
+      Row 1 : Title — e.g. "Tavistock Housekeeping  30/03/2026 to 05/04/2026] ROTA"
+      Row 2 : Column headers (Employees, Monday … Sunday, Total, RATE, TOTAL)
+      Row 3 : Actual dates (None, date, date, date, date, date, date, date, ...)
+      Row 4+ : Employee rows — col[0]=name, col[8]=total hours (numeric)
+               L/P rows      — col[0]=None or "L/P", contain daily numeric hours
+    """
+    wb = openpyxl.load_workbook(file_bytes, data_only=True)
+    ws = wb.active
 
-st.markdown("---")
+    rows = list(ws.iter_rows(values_only=True))
+
+    result = {
+        "client_name": None,
+        "week_start": None,
+        "week_end": None,
+        "employees": [],   # list of {name, total_hours}
+    }
+
+    # ── Extract title row (row 0) ─────────────────────────────
+    title = str(rows[0][0] or "") if rows else ""
+
+    # Try to extract client name (everything before the date pattern)
+    date_match = re.search(r'(\d{2}[./]\d{2}[./]\d{4})', title)
+    if date_match:
+        client_raw = title[:date_match.start()].strip().rstrip(" [")
+        result["client_name"] = re.sub(r'\s+', ' ', client_raw).strip()
+
+    # Try to extract date range from title: DD/MM/YYYY to DD/MM/YYYY
+    date_range = re.findall(r'(\d{2}[./]\d{2}[./]\d{4})', title)
+    if len(date_range) >= 2:
+        try:
+            result["week_start"] = datetime.strptime(date_range[0], "%d/%m/%Y").date()
+            result["week_end"]   = datetime.strptime(date_range[1], "%d/%m/%Y").date()
+        except:
+            pass
+
+    # ── Fallback: extract dates from row 3 (index 2) ─────────
+    if (not result["week_start"] or not result["week_end"]) and len(rows) > 2:
+        date_row = rows[2]
+        actual_dates = [v for v in date_row if isinstance(v, datetime)]
+        if len(actual_dates) >= 2:
+            result["week_start"] = actual_dates[0].date()
+            result["week_end"]   = actual_dates[-1].date()
+
+    # ── Extract employees (rows 4 onwards) ────────────────────
+    SKIP_KEYWORDS = {
+        "employees", "agency", "arvy", "total", "l/p", "shift", "rate",
+        "grand total", "rota", "housekeeping", "notes", "nan", ""
+    }
+
+    for row in rows[3:]:
+        name_val  = row[0]
+        hours_val = row[8] if len(row) > 8 else None
+
+        # Must have a string name and a numeric total hours
+        if not isinstance(name_val, str):
+            continue
+        name = name_val.strip()
+        if not name or name.lower() in SKIP_KEYWORDS:
+            continue
+        # Skip section headers (very long lines or contain keywords)
+        if any(kw in name.lower() for kw in ["agency", "arvy", "team member", "housekeeping", "supervisor"]):
+            continue
+        if not isinstance(hours_val, (int, float)):
+            continue
+        if float(hours_val) <= 0:
+            continue
+
+        result["employees"].append({
+            "name":  name,
+            "hours": float(hours_val),
+        })
+
+    return result
+
+# ── UI ────────────────────────────────────────────────────────
 st.subheader("📂 Upload Timesheet Excel")
-st.caption("Excel must have at least two columns: **Employee Name** and **Hours**")
+st.caption("Upload your ARVY rota Excel — client name, dates and employee hours are extracted automatically.")
 
-uploaded = st.file_uploader("Upload Excel timesheet", type=["xlsx", "xls", "csv"])
+uploaded = st.file_uploader("Upload timesheet (.xlsx)", type=["xlsx", "xls"])
 
-df = None
 if uploaded:
     try:
-        if uploaded.name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            xl = pd.ExcelFile(uploaded)
-            sheet = st.selectbox("Select Sheet", xl.sheet_names) if len(xl.sheet_names) > 1 else xl.sheet_names[0]
-            header_row = st.number_input("Header row (0 = first row)", 0, 20, 0)
-            df = pd.read_excel(uploaded, sheet_name=sheet, header=int(header_row))
+        parsed = parse_arvy_timesheet(uploaded)
 
-        df = df.dropna(how="all").reset_index(drop=True)
-        st.success(f"✅ File loaded — {len(df)} rows")
-        st.dataframe(df.head(20), use_container_width=True)
-    except Exception as e:
-        st.error(f"File error: {e}")
-
-if df is not None:
-    st.markdown("---")
-    st.subheader("🗂️ Map Columns")
-    cols = ["— not used —"] + list(df.columns.astype(str))
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        name_col  = st.selectbox("👤 Employee Name column", cols)
-    with c2:
-        hours_col = st.selectbox("⏱️ Hours Worked column", cols)
-    with c3:
-        notes_col = st.selectbox("📝 Notes column (optional)", cols)
-
-    if name_col != "— not used —" and hours_col != "— not used —":
         st.markdown("---")
-        st.subheader("🔍 Preview Rows")
+        st.subheader("✅ Extracted Information")
 
-        def safe_float(v):
-            try:
-                return float(str(v).replace(",", "").strip())
-            except:
-                return 0.0
+        # ── Show / allow editing of extracted header info ────
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            # Offer client dropdown — pre-select if matched
+            client_list = [c["name"] for c in clients] if clients else []
+            detected    = parsed["client_name"] or ""
+            # Try to find closest match
+            matched_idx = 0
+            for i, cn in enumerate(client_list):
+                if detected.lower()[:8] in cn.lower() or cn.lower()[:8] in detected.lower():
+                    matched_idx = i
+                    break
+            selected_client = st.selectbox(
+                "🏨 Hotel (auto-detected — confirm or change)",
+                client_list,
+                index=matched_idx
+            ) if client_list else st.text_input("🏨 Hotel Name", value=detected)
 
-        skip_words = {"nan", "", "name", "employee", "total", "grand total", "employee name"}
-        rows = []
-        for _, row in df.iterrows():
-            name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ""
-            if name.lower() in skip_words:
-                continue
-            hours = safe_float(row[hours_col]) if pd.notna(row.get(hours_col)) else 0.0
-            if not name:
-                continue
-            notes = str(row[notes_col]).strip() if notes_col != "— not used —" and pd.notna(row.get(notes_col)) else ""
-            rows.append({
-                "Employee Name": name,
-                "Hours": hours,
-                "Client": selected_client,
-                "Week Date": str(week_date),
-                "Notes": notes,
-            })
+        with c2:
+            week_start = st.date_input(
+                "📅 Week Start",
+                value=parsed["week_start"] or date.today()
+            )
+        with c3:
+            week_end = st.date_input(
+                "📅 Week End",
+                value=parsed["week_end"] or date.today()
+            )
 
-        if rows:
-            preview_df = pd.DataFrame(rows)
-            edited_df  = st.data_editor(preview_df, use_container_width=True, hide_index=True, num_rows="dynamic")
+        st.markdown("---")
+
+        if not parsed["employees"]:
+            st.error("❌ No employees found in this file. Check the format matches the ARVY rota layout.")
+        else:
+            st.subheader(f"👥 {len(parsed['employees'])} Employees Extracted")
+
+            df_preview = pd.DataFrame(parsed["employees"])
+            df_preview.columns = ["Employee Name", "Total Hours"]
+            df_preview["Hotel"]      = selected_client
+            df_preview["Week Start"] = str(week_start)
+            df_preview["Week End"]   = str(week_end)
+
+            # Editable — allow corrections before saving
+            edited = st.data_editor(
+                df_preview[["Employee Name","Total Hours","Hotel","Week Start","Week End"]],
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic"
+            )
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Employees", len(edited_df))
-            c2.metric("Total Hours", f"{edited_df['Hours'].sum():.1f}")
-            c3.metric("Hotel", selected_client)
+            c1.metric("Employees", len(edited))
+            c2.metric("Total Hours", f"{edited['Total Hours'].sum():.1f}")
+            c3.metric("Week", f"{week_start} → {week_end}")
 
-            if st.button("💾 Save Timesheets", type="primary", use_container_width=True):
+            st.markdown("---")
+            if st.button("💾 Save Timesheets to Database", type="primary", use_container_width=True):
                 saved = 0; errors = []
-                for _, r in edited_df.iterrows():
-                    name = str(r["Employee Name"]).strip()
-                    if not name:
+                for _, row in edited.iterrows():
+                    name = str(row["Employee Name"]).strip()
+                    if not name or name.lower() == "nan":
                         continue
                     try:
                         supabase.table("weekly_records").upsert({
-                            "week_date":    str(week_date),
+                            "week_date":     str(week_start),
                             "employee_name": name,
-                            "client_name":  selected_client,
-                            "hours_worked": float(r["Hours"] or 0),
-                            "notes":        str(r.get("Notes", "") or ""),
+                            "client_name":   str(row["Hotel"]),
+                            "hours_worked":  float(row["Total Hours"] or 0),
                         }, on_conflict="week_date,employee_name,client_name").execute()
                         saved += 1
                     except Exception as e:
@@ -125,31 +187,48 @@ if df is not None:
                 if errors:
                     st.error(f"⚠️ Saved {saved}, {len(errors)} error(s):\n" + "\n".join(errors))
                 else:
-                    st.success(f"✅ {saved} employees saved for **{selected_client}** — Week **{week_date}**")
+                    st.success(f"✅ {saved} employees saved — **{selected_client}** | **{week_start} → {week_end}**")
                     st.balloons()
-        else:
-            st.warning("No valid rows found. Check column mapping.")
+
+    except Exception as e:
+        st.error(f"❌ Could not parse file: {e}")
+        st.info("Make sure it's an ARVY rota Excel with the standard format.")
 
 st.markdown("---")
 
-# ── View this week's records ──────────────────────────────────
-st.subheader(f"📋 Records for {selected_client} — Week {week_date}")
+# ── View recent records ───────────────────────────────────────
+st.subheader("📋 Recent Timesheet Records")
 try:
-    recs = supabase.table("weekly_records").select("*")\
-        .eq("week_date", str(week_date))\
-        .eq("client_name", selected_client)\
-        .order("employee_name").execute().data or []
+    recs = supabase.table("weekly_records").select(
+        "week_date,employee_name,client_name,hours_worked"
+    ).order("week_date", desc=True).limit(100).execute().data or []
+
     if recs:
-        df_recs = pd.DataFrame(recs)[["employee_name","hours_worked","payroll_amount","self_emp_amount","utr_amount","notes"]]
-        df_recs.columns = ["Employee","Hours","Payroll £","Self-Emp £","UTR £","Notes"]
+        df_recs = pd.DataFrame(recs)
+        df_recs.columns = ["Week Date","Employee","Hotel","Hours"]
+
+        # Filter controls
+        hotels = ["All"] + sorted(df_recs["Hotel"].unique().tolist())
+        col1, col2 = st.columns(2)
+        with col1:
+            hotel_f = st.selectbox("Filter by Hotel", hotels)
+        with col2:
+            weeks   = ["All"] + sorted(df_recs["Week Date"].unique().tolist(), reverse=True)
+            week_f  = st.selectbox("Filter by Week", weeks)
+
+        if hotel_f != "All":
+            df_recs = df_recs[df_recs["Hotel"] == hotel_f]
+        if week_f != "All":
+            df_recs = df_recs[df_recs["Week Date"] == week_f]
+
         st.dataframe(df_recs, use_container_width=True, hide_index=True)
-        c1,c2 = st.columns(2)
+        c1, c2 = st.columns(2)
         c1.metric("Employees", len(df_recs))
         c2.metric("Total Hours", f"{df_recs['Hours'].sum():.1f}")
     else:
-        st.info("No records yet for this week/hotel. Upload a timesheet above.")
+        st.info("No records yet. Upload a timesheet above.")
 except Exception as e:
     st.warning(f"Could not load records: {e}")
 
 st.markdown("---")
-st.caption("⏱️ Timesheets  •  ARVY Portal v1.0")
+st.caption("⏱️ Timesheet Upload  •  ARVY Portal v1.0")
