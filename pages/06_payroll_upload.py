@@ -43,13 +43,30 @@ def load_all_employee_names():
     recs = supabase.table("weekly_records").select("employee_name").execute().data or []
     return sorted(set(r["employee_name"].strip() for r in recs if r.get("employee_name")))
 
+@st.cache_data(ttl=60)
+def load_employee_hotel_lookup():
+    """Return the most recent hotel for each known employee name."""
+    recs = supabase.table("weekly_records").select(
+        "employee_name,client_name,week_date"
+    ).order("week_date", desc=True).execute().data or []
+    lookup = {}
+    for r in recs:
+        name = (r.get("employee_name") or "").strip()
+        if name and name not in lookup:
+            lookup[name] = r.get("client_name", "")
+    return lookup
+
 week_recs = load_week_records(week_date)
 if selected_client != "All Hotels":
     week_recs = [r for r in week_recs if r["client_name"] == selected_client]
 
 # All known names (used for matching dropdown — not filtered by week)
-all_known_names = load_all_employee_names()
-timesheet_names = [r["employee_name"] for r in week_recs]  # week-specific (for auto-match hint)
+all_known_names    = load_all_employee_names()
+emp_hotel_lookup   = load_employee_hotel_lookup()   # {employee_name: last known hotel}
+timesheet_names    = [r["employee_name"] for r in week_recs]  # week-specific (for auto-match hint)
+
+# Hotel options for per-row dropdown
+hotel_options = ["— not set —"] + client_names
 
 if week_recs:
     st.info(f"📋 **{len(week_recs)}** timesheet employees found for week **{week_date}**")
@@ -127,6 +144,20 @@ def best_match(pdf_name, timesheet_list):
 
     return None
 
+def detect_hotel(matched_name):
+    """Return the best-guess hotel for a matched employee name."""
+    if not matched_name or matched_name == '— no match —':
+        return selected_client if selected_client != "All Hotels" else "— not set —"
+    # Check this week's records first
+    for r in week_recs:
+        if r["employee_name"] == matched_name:
+            return r["client_name"]
+    # Fall back to last known hotel from any week
+    known = emp_hotel_lookup.get(matched_name, "")
+    if known and known in client_names:
+        return known
+    return selected_client if selected_client != "All Hotels" else "— not set —"
+
 # ── Upload ────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("📂 Upload Payroll File")
@@ -138,7 +169,7 @@ uploaded = st.file_uploader(
     type=["pdf"] if file_type == "PDF" else ["xlsx", "xls", "csv"]
 )
 
-parsed_rows = []   # list of dicts: pdf_name, matched_name, net_pay, gross_pay
+parsed_rows = []   # list of dicts: pdf_name, matched_name, net_pay, gross_pay, hotel
 
 if uploaded:
     # ── PDF ──────────────────────────────────────────────────
@@ -150,13 +181,14 @@ if uploaded:
             else:
                 st.success(f"✅ Found **{len(employees)}** employees in PDF")
                 for emp in employees:
-                    matched = best_match(emp['pdf_name'], timesheet_names)
+                    matched = best_match(emp['pdf_name'], all_known_names)
                     parsed_rows.append({
-                        'PDF Name':       emp['pdf_name'],
-                        'Emp Ref':        emp['emp_ref'],
-                        'Gross Pay £':    emp['gross_pay'],
-                        'Net Pay £':      emp['net_pay'],
-                        'Matched To':     matched or '— no match —',
+                        'PDF Name':    emp['pdf_name'],
+                        'Emp Ref':     emp['emp_ref'],
+                        'Gross Pay £': emp['gross_pay'],
+                        'Net Pay £':   emp['net_pay'],
+                        'Matched To':  matched or '— no match —',
+                        'Hotel':       detect_hotel(matched),
                     })
         except Exception as e:
             st.error(f"❌ PDF error: {e}")
@@ -193,13 +225,14 @@ if uploaded:
                         continue
                     if amt == 0:
                         continue
-                    matched = best_match(n, timesheet_names)
+                    matched = best_match(n, all_known_names)
                     parsed_rows.append({
                         'PDF Name':    n,
                         'Emp Ref':     '—',
                         'Gross Pay £': amt,
                         'Net Pay £':   amt,
                         'Matched To':  matched or '— no match —',
+                        'Hotel':       detect_hotel(matched),
                     })
         except Exception as e:
             st.error(f"❌ Excel error: {e}")
@@ -208,31 +241,61 @@ if uploaded:
 if parsed_rows:
     st.markdown("---")
     st.subheader("🔍 Preview & Confirm Matching")
-    st.caption("The app tries to auto-match payroll names to your timesheet names. Correct any that say '— no match —' using the dropdown.")
+    st.caption("Auto-match payroll names to timesheet employees and confirm their hotel. Adjust any dropdowns before saving.")
 
     match_options = ['— skip —'] + all_known_names
 
     confirmed = []
+    # Header row
+    h1, h2, h3, h4, h5 = st.columns([2, 2, 2, 1, 1])
+    h1.markdown("**Payroll Name**")
+    h2.markdown("**Employee (timesheet)**")
+    h3.markdown("**Hotel**")
+    h4.markdown("**Gross**")
+    h5.markdown("**Net**")
+    st.markdown("---")
+
     for i, row in enumerate(parsed_rows):
-        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 1, 1])
+
         with c1:
-            st.markdown(f"**{row['PDF Name']}** (Ref: {row['Emp Ref']})")
+            st.markdown(f"**{row['PDF Name']}**  \n*Ref: {row['Emp Ref']}*")
+
         with c2:
             current_idx = 0
             if row['Matched To'] in match_options:
                 current_idx = match_options.index(row['Matched To'])
             sel = st.selectbox(
-                f"Match to timesheet employee",
+                "Employee",
                 match_options,
                 index=current_idx,
                 key=f"match_{i}",
                 label_visibility="collapsed"
             )
+
         with c3:
-            st.markdown(f"Gross: **£{row['Gross Pay £']:,.2f}**")
+            # Auto-detect hotel from selected employee; update when employee changes
+            auto_hotel = detect_hotel(sel) if sel != '— skip —' else (row['Hotel'] if row['Hotel'] in hotel_options else "— not set —")
+            hotel_idx  = hotel_options.index(auto_hotel) if auto_hotel in hotel_options else 0
+            hotel_sel  = st.selectbox(
+                "Hotel",
+                hotel_options,
+                index=hotel_idx,
+                key=f"hotel_{i}",
+                label_visibility="collapsed"
+            )
+
         with c4:
-            st.markdown(f"Net: **£{row['Net Pay £']:,.2f}**")
-        confirmed.append({'timesheet_name': sel, 'net_pay': row['Net Pay £'], 'pdf_name': row['PDF Name']})
+            st.markdown(f"£{row['Gross Pay £']:,.2f}")
+        with c5:
+            st.markdown(f"**£{row['Net Pay £']:,.2f}**")
+
+        confirmed.append({
+            'timesheet_name': sel,
+            'net_pay':        row['Net Pay £'],
+            'pdf_name':       row['PDF Name'],
+            'hotel':          hotel_sel,
+        })
 
     st.markdown("---")
     valid     = [r for r in confirmed if r['timesheet_name'] != '— skip —']
@@ -249,21 +312,22 @@ if parsed_rows:
 
         for r in valid:
             ts_name = r['timesheet_name']
+            hotel   = r['hotel'] if r['hotel'] != '— not set —' else "Unknown"
             try:
-                # Look up the exact record by name + week_date (works regardless of sidebar week filter)
+                # Look up the exact record by name + week_date
                 existing = supabase.table("weekly_records").select("id,client_name").eq(
                     "employee_name", ts_name
                 ).eq("week_date", str(week_date)).limit(1).execute().data
+
                 if existing:
                     supabase.table("weekly_records").update({
                         "payroll_amount": r['net_pay']
                     }).eq("id", existing[0]["id"]).execute()
                 else:
-                    client = selected_client if selected_client != "All Hotels" else "Unknown"
                     supabase.table("weekly_records").upsert({
                         "week_date":      str(week_date),
                         "employee_name":  ts_name,
-                        "client_name":    client,
+                        "client_name":    hotel,
                         "hours_worked":   0,
                         "payroll_amount": r['net_pay'],
                     }, on_conflict="week_date,employee_name,client_name").execute()
