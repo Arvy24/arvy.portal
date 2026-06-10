@@ -1,278 +1,143 @@
 import streamlit as st
 import pandas as pd
+from datetime import date, timedelta
 from db import get_client, page_header
 
 st.set_page_config(page_title="Employee Search", page_icon="🔍", layout="wide")
-page_header("🔍 Employee Search", "Find any employee and view their full payment history")
+page_header("🔍 Employee Search", "Search any employee — full history of hours and payments")
 
 supabase = get_client()
 
+if st.sidebar.button("🔄 Refresh"):
+    st.cache_data.clear(); st.rerun()
+
 @st.cache_data(ttl=60)
-def load_employees():
-    return supabase.table("employees").select(
-        "id,full_name,preferred_name,employee_ref,employment_type,ni_number,utr_number,"
-        "bank_name,bank_sort_code,bank_account_number,bank_account_name,phone,email,is_active,notes"
-    ).order("full_name").execute().data or []
+def load_employee_names():
+    recs = supabase.table("weekly_records").select("employee_name").execute().data or []
+    return sorted(set(r["employee_name"].strip() for r in recs if r.get("employee_name")))
 
-if st.sidebar.button("🔄 Refresh Data"):
-    load_employees.clear(); st.rerun()
+@st.cache_data(ttl=60)
+def load_client_names():
+    recs = supabase.table("weekly_records").select("client_name").execute().data or []
+    return sorted(set(r["client_name"].strip() for r in recs if r.get("client_name")))
 
-employees = load_employees()
+all_names   = load_employee_names()
+all_clients = load_client_names()
 
-if not employees:
-    st.error("⚠️ No employees found. Please upload employees first.")
-    st.stop()
-
-# ── Search bar ────────────────────────────────────────────────
 st.subheader("🔎 Search Employee")
-col1, col2 = st.columns([3, 1])
-with col1:
-    search = st.text_input("Search by name, ref, NI number or UTR number", placeholder="e.g. John Smith / 347 / AB123456C")
-with col2:
-    type_filter = st.selectbox("Employment Type", ["All", "payroll", "self_emp", "utr", "mixed"])
+search = st.text_input("Type employee name", placeholder="e.g. John Smith")
 
-# Filter
-filtered = employees
-if search:
-    s = search.lower()
-    filtered = [e for e in filtered if
-                s in (e.get("full_name") or "").lower() or
-                s in (e.get("employee_ref") or "").lower() or
-                s in (e.get("ni_number") or "").lower() or
-                s in (e.get("utr_number") or "").lower() or
-                s in (e.get("preferred_name") or "").lower()]
-if type_filter != "All":
-    filtered = [e for e in filtered if e.get("employment_type") == type_filter]
+matched_names = [n for n in all_names if search.lower() in n.lower()] if search else all_names
 
-st.caption(f"{len(filtered)} employee(s) found")
-
-if not filtered:
-    st.info("No employees match your search.")
+if not matched_names:
+    st.info("No employees found. Upload timesheets first to build the employee database.")
     st.stop()
 
-# ── Employee list ─────────────────────────────────────────────
-emp_opts = {f"{e['employee_ref']} — {e['full_name']} ({e['employment_type']})": e for e in filtered}
-selected_label = st.selectbox("Select employee to view", list(emp_opts.keys()))
-emp = emp_opts[selected_label]
-emp_id = emp["id"]
+selected_name = st.selectbox(f"Select employee ({len(matched_names)} found)", matched_names)
 
 st.markdown("---")
 
-# ── Employee profile card ─────────────────────────────────────
-c1, c2, c3 = st.columns(3)
+st.subheader("🔽 Filters")
+col1, col2, col3 = st.columns(3)
 
-with c1:
-    st.markdown("### 👤 Personal Details")
-    st.markdown(f"**Full Name:** {emp.get('full_name','—')}")
-    st.markdown(f"**Preferred Name:** {emp.get('preferred_name','—') or '—'}")
-    st.markdown(f"**Employee Ref:** {emp.get('employee_ref','—')}")
-    st.markdown(f"**Employment Type:** {emp.get('employment_type','—')}")
-    status = "🟢 Active" if emp.get("is_active") else "🔴 Inactive"
-    st.markdown(f"**Status:** {status}")
+with col1:
+    filter_type = st.selectbox("Quick Filter", [
+        "All Time", "This Week", "Last Week", "This Month", "Last Month", "This Year", "Custom Range"
+    ])
+with col2:
+    client_filter = st.selectbox("🏨 Hotel", ["All Hotels"] + all_clients)
+with col3:
+    date_from, date_to = None, None
+    if filter_type == "Custom Range":
+        date_from = st.date_input("From", value=date.today() - timedelta(days=30))
+        date_to   = st.date_input("To",   value=date.today())
 
-with c2:
-    st.markdown("### 🔢 Tax & Identity")
-    st.markdown(f"**NI Number:** {emp.get('ni_number','—') or '—'}")
-    st.markdown(f"**UTR Number:** {emp.get('utr_number','—') or '—'}")
-    st.markdown(f"**Phone:** {emp.get('phone','—') or '—'}")
-    st.markdown(f"**Email:** {emp.get('email','—') or '—'}")
+today = date.today()
+if filter_type == "This Week":
+    date_from = today - timedelta(days=today.weekday())
+    date_to   = today
+elif filter_type == "Last Week":
+    date_from = today - timedelta(days=today.weekday() + 7)
+    date_to   = today - timedelta(days=today.weekday() + 1)
+elif filter_type == "This Month":
+    date_from = today.replace(day=1)
+    date_to   = today
+elif filter_type == "Last Month":
+    first_this = today.replace(day=1)
+    date_to    = first_this - timedelta(days=1)
+    date_from  = date_to.replace(day=1)
+elif filter_type == "This Year":
+    date_from = today.replace(month=1, day=1)
+    date_to   = today
 
-with c3:
-    st.markdown("### 🏦 Bank Details")
-    st.markdown(f"**Bank:** {emp.get('bank_name','—') or '—'}")
-    st.markdown(f"**Sort Code:** {emp.get('bank_sort_code','—') or '—'}")
-    st.markdown(f"**Account No:** {emp.get('bank_account_number','—') or '—'}")
-    st.markdown(f"**Account Name:** {emp.get('bank_account_name','—') or '—'}")
+@st.cache_data(ttl=30)
+def load_employee_history(name, df, dt, client):
+    q = supabase.table("weekly_records").select("*").eq("employee_name", name)
+    if df:
+        q = q.gte("week_date", str(df))
+    if dt:
+        q = q.lte("week_date", str(dt))
+    if client:
+        q = q.eq("client_name", client)
+    return q.order("week_date", desc=True).execute().data or []
 
-if emp.get("notes"):
-    st.info(f"📝 Notes: {emp['notes']}")
+history = load_employee_history(
+    selected_name,
+    date_from,
+    date_to,
+    client_filter if client_filter != "All Hotels" else None
+)
+
+st.markdown("---")
+
+if not history:
+    st.info(f"No records found for **{selected_name}** with the selected filters.")
+    st.stop()
+
+df_hist = pd.DataFrame(history)
+df_hist["hours_worked"]    = pd.to_numeric(df_hist["hours_worked"],    errors="coerce").fillna(0)
+df_hist["payroll_amount"]  = pd.to_numeric(df_hist["payroll_amount"],  errors="coerce").fillna(0)
+df_hist["self_emp_amount"] = pd.to_numeric(df_hist["self_emp_amount"], errors="coerce").fillna(0)
+df_hist["utr_amount"]      = pd.to_numeric(df_hist["utr_amount"],      errors="coerce").fillna(0)
+df_hist["total_paid"]      = df_hist["payroll_amount"] + df_hist["self_emp_amount"] + df_hist["utr_amount"]
+
+total_hours   = df_hist["hours_worked"].sum()
+total_payroll = df_hist["payroll_amount"].sum()
+total_self    = df_hist["self_emp_amount"].sum()
+total_utr     = df_hist["utr_amount"].sum()
+total_paid    = df_hist["total_paid"].sum()
+
+st.subheader(f"👤 {selected_name} — {len(df_hist)} record(s)")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Total Hours",  f"{total_hours:.1f}")
+c2.metric("Payroll",      f"£{total_payroll:,.2f}")
+c3.metric("Self-Emp",     f"£{total_self:,.2f}")
+c4.metric("UTR",          f"£{total_utr:,.2f}")
+c5.metric("Total Paid",   f"£{total_paid:,.2f}")
 
 st.markdown("---")
 
-# ── Payment History Tabs ──────────────────────────────────────
-tab_summary, tab_payroll, tab_selfemp, tab_utr, tab_hours = st.tabs([
-    "📊 Summary",
-    "💷 Payroll",
-    "🧾 Self-Employed",
-    "📑 UTR",
-    "⏱️ Hours",
-])
+df_show = df_hist[["week_date","client_name","hours_worked","payroll_amount","self_emp_amount","utr_amount","total_paid","notes"]].copy()
+df_show["week_date"] = pd.to_datetime(df_show["week_date"]).dt.strftime("%d %b %Y")
+df_show.columns = ["Week Date","Hotel","Hours","Payroll £","Self-Emp £","UTR £","Total Paid £","Notes"]
 
-# ── Summary ───────────────────────────────────────────────────
-with tab_summary:
-    st.subheader("📊 All-Time Payment Summary")
-    try:
-        hist = supabase.table("v_employee_history").select("*").eq("employee_ref", emp.get("employee_ref","")).execute().data or []
-        if hist:
-            total_payroll  = sum(float(r.get("payroll_net")  or 0) for r in hist)
-            total_selfemp  = sum(float(r.get("self_emp_net") or 0) for r in hist)
-            total_utr      = sum(float(r.get("utr_net")      or 0) for r in hist)
-            total_all      = total_payroll + total_selfemp + total_utr
-            total_hrs      = sum(float(r.get("hours_received") or 0) for r in hist)
+totals_row = pd.DataFrame([{
+    "Week Date": "── TOTAL ──", "Hotel": "", "Hours": round(total_hours, 2),
+    "Payroll £": round(total_payroll, 2), "Self-Emp £": round(total_self, 2),
+    "UTR £": round(total_utr, 2), "Total Paid £": round(total_paid, 2), "Notes": ""
+}])
 
-            c1,c2,c3,c4,c5 = st.columns(5)
-            c1.metric("Total Weeks",      len(set(r.get("week_ending") for r in hist)))
-            c2.metric("Total Hours",      f"{total_hrs:.1f}")
-            c3.metric("Payroll Received", f"£{total_payroll:,.2f}")
-            c4.metric("Self-Emp Received",f"£{total_selfemp:,.2f}")
-            c5.metric("Total Earnings",   f"£{total_all:,.2f}")
+df_display = pd.concat([df_show, totals_row], ignore_index=True)
+st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-            # Weekly breakdown
-            df_hist = pd.DataFrame(hist)
-            cols_show = [c for c in ["week_ending","client","hours_received","payroll_net","self_emp_net","utr_net","total_received"] if c in df_hist.columns]
-            if cols_show:
-                df_show = df_hist[cols_show].copy()
-                df_show.columns = [c.replace("_"," ").title() for c in cols_show]
-                st.dataframe(df_show, use_container_width=True, hide_index=True)
-        else:
-            st.info("No payment history found for this employee yet.")
-    except Exception as e:
-        st.error(f"Error loading summary: {e}")
-
-# ── Payroll ───────────────────────────────────────────────────
-with tab_payroll:
-    st.subheader("💷 Payroll Payment History")
-    try:
-        pp = supabase.table("payroll_payments").select(
-            "*, weeks(week_ending), clients(name)"
-        ).eq("employee_id", emp_id).order("created_at", desc=True).execute().data or []
-
-        if pp:
-            rows = []
-            for r in pp:
-                rows.append({
-                    "Week":         (r.get("weeks") or {}).get("week_ending","—"),
-                    "Hotel":        (r.get("clients") or {}).get("name","—"),
-                    "Gross (£)":    r.get("gross_pay",0),
-                    "PAYE (£)":     r.get("paye_tax",0),
-                    "Emp NIC (£)":  r.get("employee_nic",0),
-                    "Er NIC (£)":   r.get("employer_nic",0),
-                    "Pension (£)":  r.get("employee_pension",0),
-                    "Net Pay (£)":  r.get("net_pay",0),
-                })
-            df_pp = pd.DataFrame(rows)
-            st.dataframe(df_pp, use_container_width=True, hide_index=True)
-
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Weeks Paid",     len(pp))
-            c2.metric("Total Gross",   f"£{sum(r['Gross (£)'] for r in rows):,.2f}")
-            c3.metric("Total Net",     f"£{sum(r['Net Pay (£)'] for r in rows):,.2f}")
-        else:
-            st.info("No payroll records found.")
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-# ── Self-Emp ──────────────────────────────────────────────────
-with tab_selfemp:
-    st.subheader("🧾 Self-Employed Payment History")
-    try:
-        sp = supabase.table("self_emp_payments").select(
-            "*, weeks(week_ending), clients(name)"
-        ).eq("employee_id", emp_id).order("created_at", desc=True).execute().data or []
-
-        if sp:
-            rows = []
-            for r in sp:
-                rows.append({
-                    "Week":        (r.get("weeks") or {}).get("week_ending","—"),
-                    "Hotel":       (r.get("clients") or {}).get("name","—"),
-                    "Hours":       r.get("hours_paid",0),
-                    "Rate (£)":    r.get("pay_rate",0),
-                    "Gross (£)":   r.get("gross_amount",0),
-                    "Net (£)":     r.get("net_amount",0),
-                    "Status":      r.get("payment_status","—"),
-                })
-            df_sp = pd.DataFrame(rows)
-            st.dataframe(df_sp, use_container_width=True, hide_index=True)
-
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Weeks Paid",   len(sp))
-            c2.metric("Total Hours",  f"{sum(float(r['Hours'] or 0) for r in rows):.1f}")
-            c3.metric("Total Net",   f"£{sum(float(r['Net (£)'] or 0) for r in rows):,.2f}")
-        else:
-            st.info("No self-employed records found.")
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-# ── UTR ───────────────────────────────────────────────────────
-with tab_utr:
-    st.subheader("📑 UTR Payment History")
-    try:
-        up = supabase.table("utr_payments").select(
-            "*, weeks(week_ending), clients(name)"
-        ).eq("employee_id", emp_id).order("created_at", desc=True).execute().data or []
-
-        if up:
-            rows = []
-            for r in up:
-                rows.append({
-                    "Week":        (r.get("weeks") or {}).get("week_ending","—"),
-                    "Hotel":       (r.get("clients") or {}).get("name","—"),
-                    "UTR No":      r.get("utr_number","—"),
-                    "Hours":       r.get("hours_paid",0),
-                    "Rate (£)":    r.get("pay_rate",0),
-                    "Net (£)":     r.get("net_amount",0),
-                    "Status":      r.get("payment_status","—"),
-                })
-            df_up = pd.DataFrame(rows)
-            st.dataframe(df_up, use_container_width=True, hide_index=True)
-
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Weeks Paid",  len(up))
-            c2.metric("Total Hours", f"{sum(float(r['Hours'] or 0) for r in rows):.1f}")
-            c3.metric("Total Net",  f"£{sum(float(r['Net (£)'] or 0) for r in rows):,.2f}")
-        else:
-            st.info("No UTR records found.")
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-# ── Hours ─────────────────────────────────────────────────────
-with tab_hours:
-    st.subheader("⏱️ Timesheet & Hour Disposal History")
-    try:
-        ts = supabase.table("timesheets").select(
-            "hours_received, hourly_rate, source_file, weeks(week_ending), clients(name)"
-        ).eq("employee_id", emp_id).order("created_at", desc=True).execute().data or []
-
-        hd = supabase.table("hour_disposals").select(
-            "hours_received, payroll_hours, self_emp_hours, utr_hours, weeks(week_ending), clients(name)"
-        ).eq("employee_id", emp_id).order("created_at", desc=True).execute().data or []
-
-        if ts:
-            st.markdown("**Timesheets (hours received from client):**")
-            rows_ts = []
-            for r in ts:
-                rows_ts.append({
-                    "Week":         (r.get("weeks") or {}).get("week_ending","—"),
-                    "Hotel":        (r.get("clients") or {}).get("name","—"),
-                    "Hours Received": r.get("hours_received",0),
-                    "Rate (£/hr)":   r.get("hourly_rate","—"),
-                    "Source File":   r.get("source_file","—"),
-                })
-            st.dataframe(pd.DataFrame(rows_ts), use_container_width=True, hide_index=True)
-            total_hrs = sum(float(r["Hours Received"] or 0) for r in rows_ts)
-            st.metric("Total Hours Received", f"{total_hrs:.1f}")
-        else:
-            st.info("No timesheet records found.")
-
-        if hd:
-            st.markdown("---")
-            st.markdown("**Hour Disposals (payroll / self-emp / UTR split):**")
-            rows_hd = []
-            for r in hd:
-                rows_hd.append({
-                    "Week":         (r.get("weeks") or {}).get("week_ending","—"),
-                    "Hotel":        (r.get("clients") or {}).get("name","—"),
-                    "Hrs Received": r.get("hours_received",0),
-                    "Payroll Hrs":  r.get("payroll_hours",0),
-                    "Self-Emp Hrs": r.get("self_emp_hours",0),
-                    "UTR Hrs":      r.get("utr_hours",0),
-                })
-            st.dataframe(pd.DataFrame(rows_hd), use_container_width=True, hide_index=True)
-        else:
-            st.info("No hour disposal records found.")
-    except Exception as e:
-        st.error(f"Error: {e}")
+csv = df_show.to_csv(index=False).encode()
+st.download_button(
+    f"⬇ Download {selected_name} History as CSV",
+    csv,
+    f"ARVY_{selected_name.replace(' ','_')}_history.csv",
+    "text/csv"
+)
 
 st.markdown("---")
-st.caption("💡 Tip: All data updates in real time as you upload new records.")
+st.caption("🔍 Employee Search  •  ARVY Portal v1.0")
