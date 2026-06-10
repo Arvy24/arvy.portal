@@ -34,19 +34,29 @@ st.sidebar.markdown("---")
 @st.cache_data(ttl=30)
 def load_week_records(wd):
     return supabase.table("weekly_records").select(
-        "id,employee_name,client_name,hours_worked,payroll_amount"
+        "id,employee_name,client_name,hours_worked,payroll_amount,week_date"
     ).eq("week_date", str(wd)).execute().data or []
+
+@st.cache_data(ttl=60)
+def load_all_employee_names():
+    """Load all unique employee names ever uploaded — used as match options."""
+    recs = supabase.table("weekly_records").select("employee_name").execute().data or []
+    return sorted(set(r["employee_name"].strip() for r in recs if r.get("employee_name")))
 
 week_recs = load_week_records(week_date)
 if selected_client != "All Hotels":
     week_recs = [r for r in week_recs if r["client_name"] == selected_client]
 
-timesheet_names = [r["employee_name"] for r in week_recs]
+# All known names (used for matching dropdown — not filtered by week)
+all_known_names = load_all_employee_names()
+timesheet_names = [r["employee_name"] for r in week_recs]  # week-specific (for auto-match hint)
 
 if week_recs:
     st.info(f"📋 **{len(week_recs)}** timesheet employees found for week **{week_date}**")
+elif all_known_names:
+    st.warning(f"⚠️ No timesheets for week **{week_date}** — but {len(all_known_names)} known employees available to match. Make sure the week date matches your timesheet.")
 else:
-    st.warning(f"⚠️ No timesheet records for week **{week_date}**. Upload timesheets first.")
+    st.warning("⚠️ No employees in database yet. Upload timesheets first.")
 
 # ── PDF parser ────────────────────────────────────────────────
 def parse_payroll_pdf(file_bytes):
@@ -200,7 +210,7 @@ if parsed_rows:
     st.subheader("🔍 Preview & Confirm Matching")
     st.caption("The app tries to auto-match payroll names to your timesheet names. Correct any that say '— no match —' using the dropdown.")
 
-    match_options = ['— skip —'] + timesheet_names
+    match_options = ['— skip —'] + all_known_names
 
     confirmed = []
     for i, row in enumerate(parsed_rows):
@@ -237,17 +247,17 @@ if parsed_rows:
     if valid and st.button("💾 Save Payroll Payments", type="primary", use_container_width=True):
         saved = 0; errors = []
 
-        # Build lookup: timesheet_name → record id
-        rec_lookup = {r["employee_name"]: r for r in week_recs}
-
         for r in valid:
             ts_name = r['timesheet_name']
             try:
-                rec = rec_lookup.get(ts_name)
-                if rec:
+                # Look up the exact record by name + week_date (works regardless of sidebar week filter)
+                existing = supabase.table("weekly_records").select("id,client_name").eq(
+                    "employee_name", ts_name
+                ).eq("week_date", str(week_date)).limit(1).execute().data
+                if existing:
                     supabase.table("weekly_records").update({
                         "payroll_amount": r['net_pay']
-                    }).eq("id", rec["id"]).execute()
+                    }).eq("id", existing[0]["id"]).execute()
                 else:
                     client = selected_client if selected_client != "All Hotels" else "Unknown"
                     supabase.table("weekly_records").upsert({
