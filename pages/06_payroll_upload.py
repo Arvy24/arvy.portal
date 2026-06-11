@@ -296,5 +296,78 @@ try:
 except Exception as e:
     st.warning(f"Could not load: {e}")
 
+# ═══════════════════════════════════════════════════════════════
+# Manual payroll entry
+# ═══════════════════════════════════════════════════════════════
+st.markdown("---")
+st.subheader("➕ Add / Correct Payroll Manually")
+st.caption(
+    "Use this if an employee is missing from the payroll file, or to correct a payment. "
+    "Select the timesheet name so it links to the right hours record."
+)
+
+with st.form("manual_payroll_form", clear_on_submit=True):
+    m1, m2, m3 = st.columns([3, 2, 2])
+
+    with m1:
+        # Searchable name — show week employees first, then all known
+        name_pool = week_names if week_names else all_known_names
+        manual_name = st.selectbox(
+            "👤 Employee (timesheet name)",
+            ["— select —"] + name_pool,
+            help="Pick the exact name as it appears in the timesheet"
+        )
+
+    with m2:
+        hotel_pool   = client_names if client_names else ["Unknown"]
+        # Pre-select hotel from the week record if found
+        default_hotel = selected_client if selected_client != "All Hotels" else hotel_pool[0]
+        hotel_idx     = hotel_pool.index(default_hotel) if default_hotel in hotel_pool else 0
+        manual_hotel  = st.selectbox("🏨 Hotel / Client", hotel_pool, index=hotel_idx)
+
+    with m3:
+        manual_amount = st.number_input(
+            "💷 Net Pay Amount (£)",
+            min_value=0.0, step=1.0, format="%.2f",
+            help="Net pay to record for this employee"
+        )
+
+    submitted = st.form_submit_button("💾 Save Manual Entry", type="primary", use_container_width=True)
+
+if submitted:
+    if manual_name == "— select —":
+        st.error("❌ Please select an employee name.")
+    elif manual_amount <= 0:
+        st.error("❌ Please enter a pay amount greater than £0.")
+    else:
+        try:
+            existing = supabase.table("weekly_records").select("id").eq(
+                "employee_name", manual_name
+            ).eq("week_date", str(week_date)).limit(1).execute().data
+
+            if existing:
+                supabase.table("weekly_records").update({
+                    "payroll_amount": manual_amount
+                }).eq("id", existing[0]["id"]).execute()
+                st.success(
+                    f"✅ Payroll updated — **{manual_name}** | {manual_hotel} | "
+                    f"£{manual_amount:,.2f} | week {week_start.strftime('%d %b %Y')}"
+                )
+            else:
+                supabase.table("weekly_records").upsert({
+                    "week_date":      str(week_date),
+                    "employee_name":  manual_name,
+                    "client_name":    manual_hotel,
+                    "hours_worked":   0,
+                    "payroll_amount": manual_amount,
+                }, on_conflict="week_date,employee_name,client_name").execute()
+                st.success(
+                    f"✅ Payroll added — **{manual_name}** | {manual_hotel} | "
+                    f"£{manual_amount:,.2f} | week {week_start.strftime('%d %b %Y')}"
+                )
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Could not save: {e}")
+
 st.markdown("---")
 st.caption("💷 Payroll Upload  •  ARVY Portal v1.0")
